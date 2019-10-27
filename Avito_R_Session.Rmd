@@ -1,0 +1,377 @@
+---
+Title: "Avito R Session"
+Author: ""
+Date: ""
+---
+
+### 1. Packages
+
+```{r}
+library(e1071)
+library(MASS)
+library(rpart)
+library(tree)
+library(randomForest)
+library(gbm)
+library(adaboost)
+library(xgboost)
+library(ROCR)
+library(stringdist)
+library(tidyverse)
+library(caret)
+```
+
+### 2. Loading the Dataset
+
+```{r, message=FALSE, warning=FALSE}
+category<-read_csv("Category.csv")
+location <- read_csv("Location.csv")
+train_info <- read_csv("ItemInfo_train.csv")
+test_info <- read_csv("ItemInfo_test.csv")
+train <- read_csv("ItemPairs_train.csv")
+test <- read_csv("ItemPairs_test.csv")
+```
+
+### 3. Data pre-processing
+
+```{r}
+#First, combine location and regionIDs
+train_info <- train_info %>% left_join(location)
+test_info <- test_info %>% left_join(location)
+
+#Second, combine test and train tables with the data in info files
+
+#Some functions to help with the renaming later on
+old_cols <- colnames(train)
+is_old_column <- function(x){names(x) %in% old_cols}
+check_id <- function(x,id="1"){str_sub(names(x),start = -1)==id}
+name_adder <- function(x,to_add="1"){paste0(x,to_add)}
+
+#One line dplyr call to combine tables and rename things
+train <- train %>% 
+  left_join(train_info,by=c("itemID_1" = "itemID")) %>% 
+  rename_if(!is_old_column(.),name_adder,to_add="1") %>% 
+  left_join(train_info,by=c("itemID_2" = "itemID")) %>% 
+  rename_if(!is_old_column(.) & !check_id(.,id="1"),name_adder,to_add="2")
+
+test <- test %>% 
+  left_join(test_info,by=c("itemID_1" = "itemID")) %>% 
+  rename_if(!is_old_column(.),name_adder,to_add="1") %>% 
+  left_join(test_info,by=c("itemID_2" = "itemID")) %>% 
+  rename_if(!is_old_column(.) & !check_id(.,id="1"),name_adder,to_add="2")
+
+# This function creates features
+feature_creator <- function(x){
+  x %>% 
+    mutate(#distance
+      distance = sqrt((lat1-lat2)^2+(lon1-lon2)^2),
+      #same location
+      sameLoc=as.numeric(locationID1 == locationID2),
+      #same metroID
+      samemetro = as.numeric(metroID1 ==metroID2),
+      #price
+      sameprice=as.numeric(price1 == price2),
+      priceDiff = pmax(price1/price2, price2/price1),
+      priceMin = pmin(price1, price2, na.rm=TRUE),
+      priceMax = pmax(price1, price2, na.rm=TRUE),
+      #title
+      titleStringDist = stringdist(title1, title2, method = "jw"),
+      titleStringDist2 = (stringdist(title1, title2, 
+                                     method = "lcs")/pmax(nchar(title1), nchar(title2),
+                                                          na.rm=TRUE)),
+      titleCharDiff=pmax(nchar(title1)/nchar(title2),
+                         nchar(title2)/nchar(title1)),
+      titleCharMin = pmin(nchar(title1), nchar(title2), na.rm=TRUE),
+      titleCharMax = pmax(nchar(title1), nchar(title2), na.rm=TRUE),
+      titleMatch=as.numeric(title1==title2)
+    )
+}
+train <- train %>% feature_creator
+test <- test %>% feature_creator
+
+# Remove NA Values
+train <- na.omit(train)
+```
+
+```{r}
+train <- train %>% mutate(isDuplicate=factor(isDuplicate))
+
+train <- train %>% select(isDuplicate,distance:titleMatch)
+test <- test %>% select(distance:titleMatch)
+
+validation_id <- sample(nrow(train),
+                        size = floor(nrow(train)*.10),
+                        replace = FALSE)
+
+validation <- train[validation_id,]
+train <- train[-validation_id,]
+```
+
+## 4. Models
+
+### 4.1.Logistic Regression
+```{r}
+model1 <- glm(isDuplicate ~ .,data=train,family="binomial")
+model1 %>% summary
+
+model1_pred <- model1 %>% 
+  predict(validation,type="response") %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model1_pred,"auc")@y.values[[1]] #0.7227
+```
+
+### 4.2.LDA
+```{r}
+model2 <- lda(isDuplicate~.,data = train)
+model2
+
+model2_pred <- model2 %>% 
+  predict(validation) %>% 
+  (function(x) x$posterior[,2]) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model2_pred,"auc")@y.values[[1]] #0.7230
+```
+
+
+### 4.3.QDA
+
+```{r}
+model3 <- qda(isDuplicate~.,data = train)
+model3
+
+model3_pred <- model3 %>% 
+  predict(validation) %>% 
+  (function(x) x$posterior[,2]) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model3_pred,"auc")@y.values[[1]] #0.719
+```
+
+
+### 4.4 SVM
+
+#### 4.4.1 SVM - Linear Kernel
+```{r}
+sample_train <- sample_frac(train,0.10) #we subsample due to memory limits
+
+model4a <- svm(isDuplicate~.,data=sample_train,scale = TRUE,
+               method="C-classifcation",cost=10,kernel="linear")
+
+model4a_pred <- model4a %>% 
+  predict(validation) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model4a_pred,"auc")@y.values[[1]]
+```
+
+#### 4.4.2 SVM - Polynomial Kernel
+```{r}
+model4b <- svm(isDuplicate~.,data=sample_train,scale = TRUE,
+               method="C-classifcation",cost=10,kernel="polynomial")
+
+model4b_pred <- model4b %>% 
+  predict(validation) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model4b_pred,"auc")@y.values[[1]]
+```
+
+#### 4.4.3 SVM - Radial Kernel
+```{r}
+model4c <- svm(isDuplicate~.,data=sample_train,scale = TRUE,
+               method="C-classifcation",cost=10,kernel="radial")
+
+model4c_pred <- model4c %>% 
+  predict(validation) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model4c_pred,"auc")@y.values[[1]]
+```
+
+Next, we tune the parameters of the SVM.
+
+```{r}
+svm_radial_tune <- tune(svm, 
+                        isDuplicate~.,
+                        data=sample_train,
+                        kernel="radial",
+                        ranges=list(cost=c(0.1,1,10,100,1000),
+                                    gamma=c(0.1,0.5,1,2,4,8,16)))
+summary(tune.out_radial)
+
+#we choose cost=10 and gamma=4
+
+model4cc <-svm(isDuplicate~.,
+               data=sample_train, scale = TRUE,
+               method="C-classifcation",kernel="radial",cost=10,gamma=4)
+
+model4cc_pred <- model4cc %>% 
+  predict(validation) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model4cc_pred,"auc")@y.values[[1]]
+```
+
+
+### 4.5 Randomforest
+
+We first tune the parameters with `caret`.
+
+```{r}
+temp_ctrl <- trainControl(method = "cv",number = 5) #5-fold CV
+temp_grid <- expand.grid(mtry=1:10)
+
+temp_tune <-caret::train(isDuplicate~.,data=sample_train,
+                         method="rf",
+                         trControl=temp_ctrl,
+                         tuneGrid=temp_grid,
+                         verbose=FALSE,
+                         metric="Accuracy"
+)
+temp_tune #we choose mtry=4
+```
+
+Finally, we fit with the chosen parameter and evaluate the model.
+
+```{r}
+model_rf <- randomForest(isDuplicate~.,data=sample_train,mtry=4,ntree=500)
+model_rf_pred <- model_rf %>% 
+  predict(validation,type = "prob")[,2] %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model_rf_pred,"auc")@y.values[[1]]
+```
+
+### 4.6 Gradient Boosting Machine
+
+Tuning the parameters...
+
+```{r}
+temp_ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5 # 5-fold CV
+)
+
+temp_grid <-  expand.grid(interaction.depth = 1:13, 
+                          n.trees = (1:10)*100, 
+                          shrinkage = 0.1,
+                          n.minobsinnode = 20)
+
+temp_tune <- train(isDuplicate~., data = sample_train, 
+                   method = "gbm", 
+                   trControl = temp_ctrl, 
+                   verbose = FALSE, 
+                   tuneGrid = temp_grid)
+```
+
+We use `n.trees = 400`, `interaction.depth = 8`, `shrinkage = 0.1` and `n.minobsinnode = 20`.
+
+```{r}
+model_gbm <-gbm(isDuplicate~., 
+                data = sample_train,
+                distribution = "bernoulli",
+                n.trees = 400,
+                interaction.depth = 8)
+
+model_gbm_pred <- predict(model_gbm, newdata = validation, type = "prob")%>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model_gbm_pred,"auc")@y.values[[1]]
+```
+
+### 4.7 Xgboost
+
+Tuning the parameters...
+
+```{r}
+temp_ctrl <- trainControl(method = "repeatedcv", number=5)
+
+temp_grid <- expand.grid(nrounds = seq(25,55,10),
+                         eta = c(0.09,0.1,0.11,0.3,0.5,0.7,0.9,1),
+                         max_depth = c(7,8,13,36),
+                         gamma=c(0,2,4,7,9),
+                         colsample_bytree=c(0.75,0.8,0.85),
+                         min_child_weight=c(38,47,50),
+                         subsample=c(0.75,0.8,0.85)
+)
+
+temp_tune <-train(isDuplicate~.,
+                  data = sample_train,
+                  method = "xgbTree",
+                  trControl = temp_ctrl,
+                  tuneGrid = temp_grid,
+                  verbose = FALSE,
+                  metric = "Accuracy",
+                  nthread = 3
+)
+
+xgb_tune
+plot(xgb_tune)
+```
+
+```{r}
+maxTrees <- 200
+shrinkage <- 0.10
+gamma <- 1
+depth <- 10
+minChildWeight <- 40
+colSample <- 0.85
+subSample <- 0.85
+earlyStopRound <- 4
+
+d_train <- train %>% 
+  select(-isDuplicate) %>% 
+  as.matrix %>% 
+  xgb.DMatrix(label=train$isDuplicate)
+
+d_validation <- validation %>% 
+  select(-isDuplicate) %>% 
+  as.matrix %>% 
+  xgb.DMatrix(label=validation$isDuplicate)
+
+model_xgb <- xgboost(params=list(max_depth=depth,
+                                 eta=shrinkage,
+                                 gamma=gamma,
+                                 colsample_bytree=colSample,
+                                 min_child_weight=minChildWeight),
+                     data=d_train,
+                     nrounds=90,
+                     objective="binary:logistic",
+                     eval_metric="auc")
+
+model_xgb_pred <- predict(model_xgb, d_validation) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model_xgb_pred,"auc")@y.values[[1]]
+```
+
+### 4.8 Adaboost
+
+```{r}
+temp_ctrl <- trainControl(method = "cv",number = 5)
+
+temp_grid <- expand.grid(nIter=seq(50,500,50),
+                         method=c("Adaboost.M1","Real adaboost"))
+
+temp_tune <- train(isDuplicate~.,data=sample_train,
+                   method="adaboost",
+                   trControl=temp_ctrl,
+                   tuneGrid=temp_grid,
+                   verbose=FALSE,
+                   metric="Accuracy")
+```
+
+```{r}
+model_adaboost <- adaboost(isDuplicate~.,
+                           sample_train,
+                           500,
+                           method = Adaboost.M1)
+
+model_adaboost_pred <- model_adaboost %>% 
+  predict(validation) %>% 
+  prediction(labels=validation$isDuplicate)
+
+performance(model_adaboost_pred,"auc")@y.values[[1]]
+```
